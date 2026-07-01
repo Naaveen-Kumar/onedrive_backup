@@ -1,0 +1,2 @@
+# Ignore local settings and backup configuration
+backup-config.json
