@@ -25,6 +25,36 @@ function Ensure-SettingsProperties($settings) {
     return @{ Settings = $settings; Changed = $changed }
 }
 
+function Get-DefaultDestinationFolder($path) {
+    if (Test-Path $path -PathType Container) {
+        return Split-Path -Leaf $path
+    }
+    return [System.IO.Path]::GetFileNameWithoutExtension($path)
+}
+
+function Normalize-Sources($sources) {
+    if (-not $sources) { return @() }
+    if ($sources -is [string]) { $sources = ,$sources }
+    if (-not ($sources -is [System.Array])) { $sources = ,$sources }
+
+    $normalized = @()
+    foreach ($item in $sources) {
+        if ($item -is [string]) {
+            $normalized += [PSCustomObject]@{ SourcePath = $item; DestinationFolder = Get-DefaultDestinationFolder $item }
+        } elseif ($item.PSObject.Properties.Match('SourcePath')) {
+            if (-not ($item.PSObject.Properties.Match('DestinationFolder'))) {
+                $item | Add-Member -NotePropertyName DestinationFolder -NotePropertyValue (Get-DefaultDestinationFolder $item.SourcePath)
+            } elseif ([string]::IsNullOrWhiteSpace($item.DestinationFolder)) {
+                $item.DestinationFolder = Get-DefaultDestinationFolder $item.SourcePath
+            }
+            $normalized += $item
+        } else {
+            $normalized += [PSCustomObject]@{ SourcePath = $item.ToString(); DestinationFolder = Get-DefaultDestinationFolder $item.ToString() }
+        }
+    }
+    return $normalized
+}
+
 # Load saved settings or defaults
 function Load-Settings {
     if (Test-Path $configFile) {
@@ -32,6 +62,7 @@ function Load-Settings {
             $json = Get-Content $configFile -Raw
             $settings = ConvertFrom-Json $json
             $result = Ensure-SettingsProperties $settings
+            $result.Settings.Sources = Normalize-Sources $result.Settings.Sources
             if ($result.Changed) {
                 Save-Settings $result.Settings
             }
@@ -98,10 +129,25 @@ function Update-OneDriveWarning {
 }
 
 function Update-SourcesListBox {
-    $lstSources.Items.Clear()
+    $lvSources.Items.Clear()
     foreach ($source in $settings.Sources) {
-        [void]$lstSources.Items.Add($source)
+        $sourcePath = if ($source -and $source.SourcePath) { $source.SourcePath } else { '' }
+        $destinationFolder = if ($source -and $source.DestinationFolder) { [string]$source.DestinationFolder } else { '' }
+        $item = New-Object System.Windows.Forms.ListViewItem($sourcePath)
+        $item.SubItems.Add($destinationFolder) | Out-Null
+        $item.Tag = $source
+        [void]$lvSources.Items.Add($item)
     }
+}
+
+function Resolve-DestinationRoot($destinationFolder, $baseRoot) {
+    if ([string]::IsNullOrWhiteSpace($destinationFolder)) {
+        return $baseRoot
+    }
+    if ([System.IO.Path]::IsPathRooted($destinationFolder)) {
+        return $destinationFolder
+    }
+    return Join-Path $baseRoot $destinationFolder
 }
 
 function Update-UiStatus($message) {
@@ -114,36 +160,75 @@ function Add-Source($path) {
         return
     }
 
-    $existing = $settings.Sources | Where-Object { $_ -eq $path }
-    if ($existing) {
+    if ($settings.Sources | Where-Object { $_.SourcePath -eq $path }) {
         Update-UiStatus("Path already exists in source list: $path")
         return
     }
 
-    $settings.Sources += $path
+    if (-not ($settings.Sources -is [System.Array])) {
+        $settings.Sources = @($settings.Sources)
+    }
+
+    $settings.Sources = $settings.Sources + [PSCustomObject]@{
+        SourcePath = $path
+        DestinationFolder = Get-DefaultDestinationFolder $path
+    }
     Save-Settings $settings
     Update-SourcesListBox
     Update-UiStatus("Added source: $path")
 }
 
 function Remove-SelectedSources {
-    if ($lstSources.SelectedItems.Count -eq 0) {
+    if ($lvSources.SelectedItems.Count -eq 0) {
         Update-UiStatus('No selected source to remove.')
         return
     }
 
-    $itemsToRemove = @()
-    foreach ($item in $lstSources.SelectedItems) {
-        $itemsToRemove += $item
-    }
-
-    foreach ($source in $itemsToRemove) {
-        $settings.Sources = $settings.Sources | Where-Object { $_ -ne $source }
+    foreach ($item in $lvSources.SelectedItems) {
+        $sourcePath = $item.SubItems[0].Text
+        $settings.Sources = $settings.Sources | Where-Object { $_.SourcePath -ne $sourcePath }
     }
 
     Save-Settings $settings
     Update-SourcesListBox
     Update-UiStatus('Removed selected source(s).')
+}
+
+function Update-SelectedDestinationValue {
+    if ($lvSources.SelectedItems.Count -eq 1) {
+        $selectedSource = $lvSources.SelectedItems[0].Tag
+        $txtDestination.Text = $selectedSource.DestinationFolder
+    } else {
+        $txtDestination.Text = ''
+    }
+}
+
+function Set-SelectedDestination {
+    if ($lvSources.SelectedItems.Count -eq 0) {
+        Update-UiStatus('Select at least one source to set a destination.')
+        return
+    }
+
+    $newDestination = $txtDestination.Text.Trim()
+
+    foreach ($item in $lvSources.SelectedItems) {
+        $source = $item.Tag
+        if (-not $source) {
+            $sourcePath = $item.SubItems[0].Text
+            $source = $settings.Sources | Where-Object { $_.SourcePath -eq $sourcePath }
+        }
+        if ($source) {
+            $source.DestinationFolder = $newDestination
+        }
+    }
+
+    if (-not ($settings.Sources -is [System.Array])) {
+        $settings.Sources = @($settings.Sources)
+    }
+
+    Save-Settings $settings
+    Update-SourcesListBox
+    Update-UiStatus('Updated destination for selected source(s).')
 }
 
 function Copy-ItemToOneDrive($source, $destinationRoot) {
@@ -204,18 +289,21 @@ function Perform-Backup {
     $totalSources = $settings.Sources.Count
     foreach ($source in $settings.Sources) {
         try {
-            $sourceName = Split-Path -Leaf $source
-            $targetFolder = Join-Path $destinationRoot $sourceName
-            if (Test-Path $source -PathType Container) {
-                Copy-ItemToOneDrive $source $targetFolder
+            $defaultDestinationRoot = Join-Path $destinationRoot (Get-DefaultDestinationFolder $source.SourcePath)
+            if ([string]::IsNullOrWhiteSpace($source.DestinationFolder)) {
+                $sourceDestinationRoot = $defaultDestinationRoot
+            } elseif ([System.IO.Path]::IsPathRooted($source.DestinationFolder)) {
+                $sourceDestinationRoot = $source.DestinationFolder
             } else {
-                Copy-ItemToOneDrive $source $destinationRoot
+                $sourceDestinationRoot = Join-Path $destinationRoot $source.DestinationFolder
             }
+
+            Copy-ItemToOneDrive $source.SourcePath $sourceDestinationRoot
             $progress++
             $lblProgress.Text = "Backing up $progress of $totalSources..."
             [System.Windows.Forms.Application]::DoEvents()
         } catch {
-            Update-UiStatus("Error copying ${source}: $($_.Exception.Message)")
+            Update-UiStatus("Error copying $($source.SourcePath): $($_.Exception.Message)")
         }
     }
 
@@ -325,11 +413,17 @@ $grpSources.Location = New-Object System.Drawing.Point(14, 50)
 $grpSources.Size = New-Object System.Drawing.Size(726, 250)
 [void]$form.Controls.Add($grpSources)
 
-$lstSources = New-Object System.Windows.Forms.ListBox
-$lstSources.Location = New-Object System.Drawing.Point(12, 22)
-$lstSources.Size = New-Object System.Drawing.Size(700, 170)
-$lstSources.SelectionMode = 'MultiExtended'
-[void]$grpSources.Controls.Add($lstSources)
+$lvSources = New-Object System.Windows.Forms.ListView
+$lvSources.Location = New-Object System.Drawing.Point(12, 22)
+$lvSources.Size = New-Object System.Drawing.Size(700, 170)
+$lvSources.View = 'Details'
+$lvSources.FullRowSelect = $true
+$lvSources.GridLines = $true
+$lvSources.HeaderStyle = 'Nonclickable'
+$lvSources.MultiSelect = $true
+$lvSources.Columns.Add('Source', 420) | Out-Null
+$lvSources.Columns.Add('Destination', 260) | Out-Null
+[void]$grpSources.Controls.Add($lvSources)
 
 $btnAddFile = New-Object System.Windows.Forms.Button
 $btnAddFile.Text = 'Add File'
@@ -348,6 +442,23 @@ $btnRemoveSource.Text = 'Remove Selected'
 $btnRemoveSource.Location = New-Object System.Drawing.Point(232, 200)
 $btnRemoveSource.Size = New-Object System.Drawing.Size(120, 28)
 [void]$grpSources.Controls.Add($btnRemoveSource)
+
+$lblDestination = New-Object System.Windows.Forms.Label
+$lblDestination.Text = 'Destination folder:'
+$lblDestination.Location = New-Object System.Drawing.Point(12, 230)
+$lblDestination.Size = New-Object System.Drawing.Size(120, 20)
+[void]$grpSources.Controls.Add($lblDestination)
+
+$txtDestination = New-Object System.Windows.Forms.TextBox
+$txtDestination.Location = New-Object System.Drawing.Point(130, 228)
+$txtDestination.Size = New-Object System.Drawing.Size(380, 24)
+[void]$grpSources.Controls.Add($txtDestination)
+
+$btnSetDestination = New-Object System.Windows.Forms.Button
+$btnSetDestination.Text = 'Set Destination'
+$btnSetDestination.Location = New-Object System.Drawing.Point(520, 225)
+$btnSetDestination.Size = New-Object System.Drawing.Size(120, 28)
+[void]$grpSources.Controls.Add($btnSetDestination)
 
 $grpSchedule = New-Object System.Windows.Forms.GroupBox
 $grpSchedule.Text = 'Schedule'
@@ -461,6 +572,9 @@ $btnAddFolder.Add_Click({
 })
 
 [void]$btnRemoveSource.Add_Click({ Remove-SelectedSources })
+
+[void]$btnSetDestination.Add_Click({ Set-SelectedDestination })
+[void]$lvSources.Add_SelectedIndexChanged({ Update-SelectedDestinationValue })
 
 [void]$btnSaveSettings.Add_Click({
     $settings.Frequency = $comboFrequency.SelectedItem
